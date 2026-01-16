@@ -101,6 +101,7 @@ data "azurerm_key_vault_key" "key_principal" {
   key_vault_id = data.azurerm_key_vault.akv_principal[0].id
 }
 
+/*
 # User Assigned Identity (solo si CMK está activo)
 resource "azurerm_user_assigned_identity" "uai" {
   count = local.key_cmk ? 1 : 0
@@ -111,7 +112,16 @@ resource "azurerm_user_assigned_identity" "uai" {
 
   tags = var.inherit ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags) : local.tags
 }
+*/
+# Create and configure a User Manage Identity
+resource "azurerm_user_assigned_identity" "uai" {
+  count = local.key_cmk ? 1 : 0
 
+  resource_group_name = data.azurerm_resource_group.rsg_principal.name
+  location            = data.azurerm_resource_group.rsg_principal.location
+  name                = var.uai_name
+  tags                = var.inherit ? merge(merge(data.azurerm_resource_group.rsg_principal.tags, var.custom_tags), local.private_tags) : local.tags
+}
 # Permisos en KV para que la UAI pueda usar la key
 resource "azurerm_key_vault_access_policy" "akv_access_policy" {
   count      = local.key_cmk ? 1 : 0
