@@ -109,9 +109,7 @@ resource "azurerm_user_assigned_identity" "uai" {
   location            = data.azurerm_resource_group.rsg_principal.location
   resource_group_name = data.azurerm_resource_group.rsg_principal.name
 
-  tags = var.inherit
-    ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags)
-    : local.tags
+  tags = var.inherit ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags) : local.tags
 }
 
 # Permisos en KV para que la UAI pueda usar la key
