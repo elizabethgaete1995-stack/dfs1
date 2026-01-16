@@ -1,5 +1,12 @@
 ############################################
-# LOCALS (CORREGIDO)
+# MAIN.TF - Azure Data Factory (ADF)
+# - CMK opcional (Key Vault + Key + UAI)
+# - GitHub config opcional
+# - ADF Analytics (ARM) + Diagnostic settings opcional (Log Analytics)
+############################################
+
+############################################
+# LOCALS
 ############################################
 locals {
   # Activa CMK solo si realmente lo estás usando
@@ -13,18 +20,18 @@ locals {
 
   # Tags base
   private_tags = {
-    entity        = try(var.entity, null)
-    environment   = try(var.environment, null)
-    app_name      = try(var.app_name, null)
-    cost_center   = try(var.cost_center, null)
-    tracking_code = try(var.tracking_code, null)
+    entity          = try(var.entity, null)
+    environment     = try(var.environment, null)
+    app_name        = try(var.app_name, null)
+    cost_center     = try(var.cost_center, null)
+    tracking_code   = try(var.tracking_code, null)
     "hidden-deploy" = "curated"
   }
 
   # Tags finales
   tags = merge(local.private_tags, try(var.custom_tags, {}), try(var.optional_tags, {}))
 
-  # Parámetros para ARM analytics (ajusta nombres a los que tu analytics.json espere)
+  # Parámetros ARM para ADF Analytics (ajusta a lo que tu analytics.json espere)
   parameters_adanalytics = {
     name              = { value = var.adf_name }
     location          = { value = var.location }
@@ -45,6 +52,7 @@ data "azurerm_resource_group" "rsg_principal" {
   name = var.rsg_name
 }
 
+# Key Vault (solo si CMK está activo)
 data "azurerm_key_vault" "akv_principal" {
   count      = local.key_cmk ? 1 : 0
   depends_on = [data.azurerm_resource_group.rsg_principal]
@@ -53,6 +61,7 @@ data "azurerm_key_vault" "akv_principal" {
   resource_group_name = data.azurerm_resource_group.rsg_principal.name
 }
 
+# Log Analytics Workspace (solo si diagnostics/analytics está activo)
 data "azurerm_log_analytics_workspace" "lwk_principal" {
   count = local.lwk_enabled ? 1 : 0
 
@@ -61,8 +70,9 @@ data "azurerm_log_analytics_workspace" "lwk_principal" {
 }
 
 ############################################
-# KEY + UAI (CMK)
+# CMK - KEY + UAI + ACCESS POLICY (OPCIONAL)
 ############################################
+# Crea la key solo si CMK está activo y NO existe una ya creada
 resource "azurerm_key_vault_key" "key_generate" {
   count      = (!var.key_exist && local.key_cmk) ? 1 : 0
   depends_on = [data.azurerm_key_vault.akv_principal]
@@ -72,9 +82,17 @@ resource "azurerm_key_vault_key" "key_generate" {
   key_type     = "RSA"
   key_size     = 2048
 
-  key_opts = ["decrypt", "encrypt", "sign", "unwrapKey", "verify", "wrapKey"]
+  key_opts = [
+    "decrypt",
+    "encrypt",
+    "sign",
+    "unwrapKey",
+    "verify",
+    "wrapKey",
+  ]
 }
 
+# Obtiene la key (si CMK está activo)
 data "azurerm_key_vault_key" "key_principal" {
   count      = local.key_cmk ? 1 : 0
   depends_on = [azurerm_key_vault_key.key_generate]
@@ -83,15 +101,20 @@ data "azurerm_key_vault_key" "key_principal" {
   key_vault_id = data.azurerm_key_vault.akv_principal[0].id
 }
 
+# User Assigned Identity (solo si CMK está activo)
 resource "azurerm_user_assigned_identity" "uai" {
   count = local.key_cmk ? 1 : 0
 
-  resource_group_name = data.azurerm_resource_group.rsg_principal.name
-  location            = data.azurerm_resource_group.rsg_principal.location
   name                = var.uai_name
-  tags                = var.inherit ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags) : local.tags
+  location            = data.azurerm_resource_group.rsg_principal.location
+  resource_group_name = data.azurerm_resource_group.rsg_principal.name
+
+  tags = var.inherit
+    ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags)
+    : local.tags
 }
 
+# Permisos en KV para que la UAI pueda usar la key
 resource "azurerm_key_vault_access_policy" "akv_access_policy" {
   count      = local.key_cmk ? 1 : 0
   depends_on = [data.azurerm_key_vault.akv_principal, azurerm_user_assigned_identity.uai]
@@ -105,18 +128,21 @@ resource "azurerm_key_vault_access_policy" "akv_access_policy" {
 }
 
 ############################################
-# DATA FACTORY (CORREGIDO identity_ids)
+# AZURE DATA FACTORY
 ############################################
 resource "azurerm_data_factory" "adf" {
-  name                            = var.adf_name
-  location                        = var.location
-  resource_group_name             = data.azurerm_resource_group.rsg_principal.name
+  name                = var.adf_name
+  location            = var.location
+  resource_group_name = data.azurerm_resource_group.rsg_principal.name
+
   managed_virtual_network_enabled = var.adf_vnet_enabled
   public_network_enabled          = var.adf_public_network_access_enabled
 
+  # CMK (solo si aplica)
   customer_managed_key_id          = local.key_cmk ? data.azurerm_key_vault_key.key_principal[0].id : null
   customer_managed_key_identity_id = local.key_cmk ? azurerm_user_assigned_identity.uai[0].id : null
 
+  # GitHub config (solo si aplica)
   dynamic "github_configuration" {
     for_each = var.enable_github ? [1] : []
     content {
@@ -128,18 +154,24 @@ resource "azurerm_data_factory" "adf" {
     }
   }
 
+  # Identity
   identity {
     type = local.key_cmk ? "UserAssigned" : "SystemAssigned"
 
-    # <- FIX: concat correcto (lista + [id])
+    # Si CMK está activo, agregamos la UAI a identity_list (si viene vacía, no pasa nada)
     identity_ids = local.key_cmk
       ? distinct(compact(concat(try(var.identity_list, []), [azurerm_user_assigned_identity.uai[0].id])))
       : null
   }
 
-  tags = var.inherit ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags) : local.tags
+  tags = var.inherit
+    ? merge(data.azurerm_resource_group.rsg_principal.tags, local.tags)
+    : local.tags
 }
 
+############################################
+# LINKED SERVICE KEY VAULT (solo si CMK)
+############################################
 resource "azurerm_data_factory_linked_service_key_vault" "linked" {
   count      = local.key_cmk ? 1 : 0
   depends_on = [azurerm_data_factory.adf]
@@ -150,7 +182,7 @@ resource "azurerm_data_factory_linked_service_key_vault" "linked" {
 }
 
 ############################################
-# ADF Analytics (HACERLO CONDICIONAL)
+# ADF ANALYTICS (ARM DEPLOYMENT) - solo si lwk_enabled
 ############################################
 resource "azurerm_resource_group_template_deployment" "ADAnalytics" {
   count = local.lwk_enabled ? 1 : 0
@@ -169,7 +201,7 @@ resource "azurerm_resource_group_template_deployment" "ADAnalytics" {
 }
 
 ############################################
-# Diagnostic monitor (CONDICIONAL + DEPENDENCIA OK)
+# DIAGNOSTIC SETTINGS - solo si lwk_enabled
 ############################################
 resource "azurerm_monitor_diagnostic_setting" "mdsettings" {
   count = local.lwk_enabled ? 1 : 0
@@ -188,13 +220,16 @@ resource "azurerm_monitor_diagnostic_setting" "mdsettings" {
   enabled_log { category = "PipelineRuns" }
   enabled_log { category = "TriggerRuns" }
   enabled_log { category = "SandboxPipelineRuns" }
+
   enabled_log { category = "SSISPackageEventMessages" }
   enabled_log { category = "SSISPackageExecutableStatistics" }
   enabled_log { category = "SSISPackageEventMessageContext" }
   enabled_log { category = "SSISPackageExecutionComponentPhases" }
   enabled_log { category = "SSISPackageExecutionDataStatistics" }
   enabled_log { category = "SSISIntegrationRuntimeLogs" }
+
   enabled_log { category = "SandboxActivityRuns" }
+
   enabled_log { category = "AirflowDagProcessingLogs" }
   enabled_log { category = "AirflowTaskLogs" }
   enabled_log { category = "AirflowWebLogs" }
